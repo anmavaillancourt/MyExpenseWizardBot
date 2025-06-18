@@ -667,5 +667,4 @@ require('dotenv').config();
      } finally {
        await fsPromises.unlink(tempPath);
      }
-   }
- } // Closing brace for bot.on('message', ...) - Line 669
+   } // Closing brace for bot.on('message', ...) - Line 669
