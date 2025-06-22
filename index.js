@@ -146,7 +146,25 @@ require('dotenv').config();
  }
 
  async function extractFromImage(base64Image) {
-   const prompt = `You're a receipt reader. Extract this information in JSON format with no markdown or code fences:\n{\n  "amount": 12.34,\n  "currency": "CAD",\n  "name": "Vendor name",\n  "date": "5 June"\n}\nReturn only the JSON object.`;
+   const prompt = `
+   You are a receipt reader. Extract the following information from the provided image in JSON format with no markdown or code fences:
+   {
+     "type": "expense|earning|paypal_fee",
+     "amount": number,
+     "currency": "CAD" | "USD",
+     "name": "sender or vendor name",
+     "date": {
+       "day": number,
+       "month": string (e.g., "June" or "juin" initially, then convert to English like "June"),
+       "year": number (use current year 2025 if not specified)
+     },
+     "valid": boolean
+   }
+   - Determine the type (expense, earning, or paypal_fee) based on the image content (e.g., "invoice" or "payment received" for earning, "fee" for paypal_fee, otherwise expense).
+   - Accept dates in French (e.g., "18 juin") or English (e.g., "18 June") and convert the month to the English full name (e.g., "June" for "juin" or "June").
+   - If the day, month, or year cannot be determined, set the corresponding field to null and include a "valid": false flag in the JSON.
+   - Return only the JSON object.
+   `;
 
    try {
      const result = await openai.chat.completions.create({
@@ -278,19 +296,218 @@ require('dotenv').config();
    await handleUSDConversion(chatId, match[1].trim());
  });
 
+// Global variable to store pending image data for clarification
+const pendingImageTransactions = {};
+
+// Refactored function to process image transactions
+async function processImageTransaction(chatId, fileId, parsed, transactionType, tempPath, responseData) {
+    const { amount, currency, name, date, valid = true } = parsed;
+    const { day, month, year = 2025 } = date;
+
+    if (!day || !month || typeof day !== 'number' || day < 1 || day > 31 || typeof month !== 'string' || !valid) {
+        throw new Error(`Invalid date or data from image: "${JSON.stringify(date)}"`);
+    }
+
+    const baseDate = new Date(`${month} ${day}, ${year}`);
+    if (isNaN(baseDate)) {
+        throw new Error(`Invalid date: "${JSON.stringify(date)}"`);
+    }
+
+    const formattedDate = baseDate.toLocaleDateString('en-US', { month: 'numeric', day: 'numeric', year: 'numeric' });
+    console.log(`Image: ${fileId}: Date: ${formattedDate}`);
+
+    const capitalMonth = capitalize(month);
+    const tabName = monthMap[capitalMonth] || capitalMonth;
+
+    if (!Object.keys(monthMap).map(m => m.toLowerCase()).includes(capitalMonth.toLowerCase())) {
+        throw new Error(`Invalid month: "${month}"`);
+    }
+
+    let folderId;
+    let transactionTypeForMessage = transactionType;
+    if (transactionType === 'earning') {
+        folderId = EARNINGS_FOLDER;
+    } else if (transactionType === 'expense') {
+        folderId = EXPENSES_FOLDER;
+    } else {
+        folderId = EXPENSES_FOLDER; // Default for paypal_fee or other cases
+    }
+
+    const link = await uploadToDrive(tempPath, `${name || 'Unknown'}_${formattedDate}.jpg`, folderId);
+    console.log(`Image: ${fileId}: Drive link: ${link}`);
+
+    let sheet;
+    try {
+        sheet = await getSheet(tabName);
+    } catch (err) {
+        throw new Error(`Failed to get sheet ${tabName}: ${err.message}`);
+    }
+
+    let rowData = new Array(12).fill('');
+    rowData[0] = formattedDate;
+
+    let insertIndex = -1;
+    for (let i = 1; i < sheet.length; i++) {
+        const rowDate = new Date(sheet[i][0]);
+        const expenseEmpty = [1, 2, 3].every(idx => !sheet[i][idx]?.trim());
+        const earningEmpty = [4, 5, 6].every(idx => !sheet[i][idx]?.trim());
+        const paypalFeeEmpty = [8, 9].every(idx => !sheet[i][idx]?.trim());
+
+        if (rowDate.getTime() === baseDate.getTime()) {
+            if (transactionType === 'expense' && expenseEmpty) {
+                insertIndex = i;
+                break;
+            } else if (transactionType === 'earning' && earningEmpty) {
+                insertIndex = i;
+                break;
+            } else if (transactionType === 'paypal_fee' && paypalFeeEmpty) {
+                insertIndex = i;
+                break;
+            }
+        }
+    }
+
+    if (insertIndex > 0) {
+        rowData = sheet[insertIndex].slice();
+    }
+
+    let targetInsertIndex = null;
+    if (insertIndex === -1) {
+        let lastIndex = -1;
+        for (let i = 1; i < sheet.length; i++) {
+            const rowDate = new Date(sheet[i][0]);
+            if (rowDate.getTime() === baseDate.getTime()) {
+                lastIndex = i;
+            }
+        }
+        if (lastIndex !== -1) {
+            targetInsertIndex = lastIndex + 1;
+        }
+    }
+
+    console.log(`Image: ${fileId}: Processing determined type: ${transactionType}, amount: ${amount}, currency: ${currency}, name: ${name}, date: ${formattedDate}`);
+
+    if (transactionType === 'expense') {
+        console.log(`Image: Assigning to expense columns: name=${name} to index 1, CAD=${amount} to index 2, USD=$${amount} to index 3`);
+        rowData[1] = name || rowData[1] || 'Unknown';
+        rowData[2] = currency === 'CAD' ? amount : (rowData[2] || '');
+        rowData[3] = currency === 'USD' ? `$${amount}` : (rowData[3] || '');
+        rowData[10] = link;
+        rowData[4] = rowData[4] || '';
+        rowData[5] = rowData[5] || '';
+        rowData[6] = rowData[6] || '';
+        rowData[8] = rowData[8] || '';
+        rowData[9] = rowData[9] || '';
+        rowData[11] = rowData[11] || '';
+    } else if (transactionType === 'earning') {
+        console.log(`Image: Assigning to earning columns: name=${name} to index 4, CAD=${amount} to index 5, USD=$${amount} to index 6`);
+        rowData[4] = name || rowData[4] || 'Unknown';
+        rowData[5] = currency === 'CAD' ? amount : (rowData[5] || '');
+        rowData[6] = currency === 'USD' ? `$${amount}` : (rowData[6] || '');
+        rowData[11] = link;
+        rowData[1] = rowData[1] || '';
+        rowData[2] = rowData[2] || '';
+        rowData[3] = rowData[3] || '';
+        rowData[8] = rowData[8] || '';
+        rowData[9] = rowData[9] || '';
+        rowData[10] = rowData[10] || '';
+    } else if (transactionType === 'paypal_fee') {
+        console.log(`Image: Assigning to PayPal fee columns: USD=$${amount} to index 8, CAD=${amount} to index 9`);
+        rowData[8] = currency === 'USD' ? `$${amount}` : (rowData[8] || '');
+        rowData[9] = currency === 'CAD' ? amount : (rowData[9] || '');
+        rowData[10] = rowData[10] || '';
+        rowData[11] = rowData[11] || '';
+        rowData[1] = rowData[1] || '';
+        rowData[2] = rowData[2] || '';
+        rowData[3] = rowData[3] || '';
+        rowData[4] = rowData[4] || '';
+        rowData[5] = rowData[5] || '';
+        rowData[6] = rowData[6] || '';
+    }
+
+    console.log(`Image: ${fileId}: Final rowData before insert: ${JSON.stringify(rowData)}`);
+
+    try {
+        if (insertIndex > 0) {
+            console.log(`Image: ${fileId}: Updating row ${insertIndex + 1} with data=${JSON.stringify(rowData)}`);
+            await updateRow(tabName, insertIndex, rowData);
+        } else {
+            console.log(`Image: ${fileId}: Inserting new row at ${targetInsertIndex !== null ? targetInsertIndex + 1 : 'bottom'} with data=${JSON.stringify(rowData)}`);
+            await insertRow(tabName, rowData, targetInsertIndex);
+        }
+        bot.sendMessage(chatId, `IMAGE Added ${transactionTypeForMessage} for ${name || 'Unknown'} on ${formattedDate}`);
+    } catch (err) {
+        console.error(`Image: ${fileId}: Error adding entry:`, err.message);
+        bot.sendMessage(chatId, `ERROR Failed to process receipt: ${err.message}`);
+        throw err; // Re-throw to allow outer catch to handle cleanup
+    } finally {
+        // Ensure temp file is deleted even if there's an error during sheet update
+        if (fs.existsSync(tempPath)) {
+            await fsPromises.unlink(tempPath).catch(err => console.error(`Failed to delete temp file ${tempPath}:`, err.message));
+        }
+    }
+}
+
+
  bot.on('message', async (msg) => {
    const chatId = msg.chat.id;
    const text = msg.text?.toLowerCase() || '';
    console.log("BOT Heard message:", text);
 
-   // Handle conversion requests first
+   // 1. Handle pending image transaction follow-up
+   if (text && pendingImageTransactions[chatId]) {
+       const pending = pendingImageTransactions[chatId];
+       let followUpType = null;
+       if (text.includes('expense')) {
+           followUpType = 'expense';
+       } else if (text.includes('earning')) {
+           followUpType = 'earning';
+       } else if (text.includes('paypal fee') || text.includes('paypal_fee')) {
+           followUpType = 'paypal_fee';
+       }
+
+       if (followUpType) {
+           console.log(`Follow-up: Received type "${followUpType}" for pending image ${pending.fileId}`);
+           // Use the original parsed data, but override the type
+           pending.parsed.type = followUpType;
+
+           try {
+               await processImageTransaction(
+                   chatId,
+                   pending.fileId,
+                   pending.parsed,
+                   pending.parsed.type,
+                   pending.tempPath,
+                   pending.responseData
+               );
+               delete pendingImageTransactions[chatId]; // Clear pending state
+           } catch (err) {
+               console.error(`Follow-up: Error processing pending image ${pending.fileId}:`, err.message);
+               bot.sendMessage(chatId, `ERROR Failed to finalize image entry: ${err.message}`);
+           } finally {
+               // Ensure the temp file created during the initial image upload attempt is cleaned up
+               if (fs.existsSync(pending.tempPath)) {
+                   await fsPromises.unlink(pending.tempPath).catch(err => console.error(`Failed to delete temp file ${pending.tempPath}:`, err.message));
+               }
+               delete pendingImageTransactions[chatId]; // Ensure state is cleared on success or failure
+           }
+           return; // Stop further processing as this was a follow-up
+       } else {
+           // User replied, but not with a valid type clarification
+           bot.sendMessage(chatId, `I'm still waiting for you to specify "expense", "earning", or "paypal fee" for the previous image. Please try again or send a new transaction.`);
+           // Don't clear pendingImageTransactions[chatId] yet, give them another chance
+           return;
+       }
+   }
+
+   // Handle conversion requests first (existing logic)
    const monthKeywords = [...Object.keys(monthMap), ...Object.values(monthMap)].map(m => m.toLowerCase());
    const monthMatch = monthKeywords.find(m => text.includes(m));
    const mentionedMonth = monthMatch
      ? monthMap[capitalize(monthMatch)] || capitalize(monthMatch)
      : (text.includes("all") ? "none" : null);
 
-   if (text && !msg.photo) {
+   if (text && !msg.photo) { // This block handles regular text messages (not image captions)
      const isConversionRequest = /convert.*usd|usd.*convert|update.*usd|missing.*usd|usd.*missing/i.test(text);
      if (isConversionRequest && mentionedMonth && mentionedMonth !== 'none') {
        console.log(`Conversion: Detected request for month ${mentionedMonth}`);
@@ -309,7 +526,7 @@ require('dotenv').config();
        Example input: "convert USD in June"
        Example output: {"isConversionRequest":true,"month":"June"}
        Example input: "convert usd for june"
-       Example output: {"isConversionRequest":true,"month":"June"}
+       Example output: {"isConversionRequest":true,"month":null} // Modified example: "june" implies the month
        Input: "${text}"
      `;
 
@@ -333,6 +550,7 @@ require('dotenv').config();
      }
    }
 
+   // Original text message processing (if not a conversion request or photo)
    if (text && !msg.photo) {
      const prompt = `
        You're a financial assistant for a Telegram bot. Analyze the user's message and determine if it describes an expense, earning, or PayPal fee. Extract the following details in JSON format (no markdown or code fences):
@@ -394,68 +612,117 @@ require('dotenv').config();
        return bot.sendMessage(chatId, `WARNING ${err.message}`);
      }
 
-     let insertIndex = sheet.findIndex((row, i) => {
-       if (i === 0) return false;
-       const rowDate = new Date(row[0]);
-       const targetDate = baseDate;
-       return rowDate.getDate() === targetDate.getDate() &&
-              rowDate.getMonth() === targetDate.getMonth() &&
-              rowDate.getFullYear() === targetDate.getFullYear() &&
-              row.slice(1, 12).every(cell => !cell?.trim());
-     });
+      let insertIndex = -1;
+      for (let i = 1; i < sheet.length; i++) {
+        const rowDate = new Date(sheet[i][0]);
+        // Check if the date matches AND if the relevant columns for the transaction type are empty
+        const expenseEmpty = [1, 2, 3].every(idx => !sheet[i][idx]?.trim());
+        const earningEmpty = [4, 5, 6].every(idx => !sheet[i][idx]?.trim());
+        const paypalFeeEmpty = [8, 9].every(idx => !sheet[i][idx]?.trim());
 
-     let targetInsertIndex = null;
-     if (insertIndex === -1) {
-       let lastIndex = -1;
-       for (let i = 1; i < sheet.length; i++) {
-         const rowDate = new Date(sheet[i][0]);
-         if (rowDate.getDate() === baseDate.getDate() &&
-             rowDate.getMonth() === baseDate.getMonth() &&
-             rowDate.getFullYear() === baseDate.getFullYear()) {
-           lastIndex = i;
-         }
-       }
-       if (lastIndex !== -1) {
-         targetInsertIndex = lastIndex + 1;
-       }
-     }
+        if (rowDate.getTime() === baseDate.getTime()) {
+          if ((type === 'expense' && expenseEmpty) ||
+              (type === 'earning' && earningEmpty) ||
+              (type === 'paypal_fee' && paypalFeeEmpty)) {
+            insertIndex = i;
+            break;
+          }
+        }
+      }
 
-     // Simplified log to avoid syntax issues
-     const filteredRows = sheet.filter(row => new Date(row[0]).toLocaleDateString('en-US', { month: 'numeric', day: 'numeric', year: 'numeric' }) === formattedDate);
-     console.log(`Text: Insert info: index=${insertIndex}, date=${formattedDate}, targetIndex=${targetInsertIndex}, rows=${JSON.stringify(filteredRows)}`);
+      let targetInsertIndex = null;
+      if (insertIndex === -1) {
+        let lastIndex = -1;
+        for (let i = 1; i < sheet.length; i++) {
+          const rowDate = new Date(sheet[i][0]);
+          if (rowDate.getTime() === baseDate.getTime()) {
+            lastIndex = i;
+          }
+        }
+        if (lastIndex !== -1) {
+          targetInsertIndex = lastIndex + 1;
+        }
+      }
 
-     const rowData = new Array(12).fill('');
-     rowData[0] = formattedDate;
-     rowData[1] = name || 'Unknown';
+      const filteredRows = sheet.filter(row => new Date(row[0]).toLocaleDateString('en-US', { month: 'numeric', day: 'numeric', year: 'numeric' }) === formattedDate);
+      console.log(`Text: Insert info: index=${insertIndex}, date=${formattedDate}, targetIndex=${targetInsertIndex}, rows=${JSON.stringify(filteredRows)}`);
 
-     if (type === 'expense') {
-       rowData[currency === 'CAD' ? 2 : 3] = currency === 'CAD' ? amount : `$${amount}`;
-     } else if (type === 'earning') {
-       rowData[4] = currency === 'CAD' ? amount : '';
-       rowData[5] = currency === 'CAD' ? amount : '';
-       rowData[6] = currency === 'USD' ? `$${amount}` : '';
-     } else if (type === 'paypal_fee') {
-       rowData[8] = currency === 'USD' ? `$${amount}` : '';
-       rowData[9] = currency === 'CAD' ? amount : '';
-     }
+      let rowData = new Array(12).fill('');
+      rowData[0] = formattedDate; // Column A (Date)
 
-     try {
-       if (insertIndex > 0) {
-         console.log(`Text: Updating row ${insertIndex + 1} with data=${JSON.stringify(rowData)}`);
-         await updateRow(tabName, insertIndex, rowData);
-       } else {
-         console.log(`Text: Inserting new row at ${targetInsertIndex !== null ? targetInsertIndex + 1 : 'bottom'} with data=${JSON.stringify(rowData)}`);
-         await insertRow(tabName, rowData, targetInsertIndex);
-       }
-       bot.sendMessage(chatId, `SUCCESS Added ${type} for ${name || 'Unknown'} on ${formattedDate}`);
-     } catch (err) {
-       console.error(`Text: Error adding entry: ${err.message}`);
-       bot.sendMessage(chatId, `ERROR Failed to add entry: ${err.message}`);
-     }
-     return;
+      // Preserve existing row data if updating
+      if (insertIndex > 0) {
+        rowData = sheet[insertIndex].slice(); // Copy existing row
+      }
+
+      console.log(`Text: Processing type: ${type}, amount: ${amount}, currency: ${currency}, date: ${formattedDate}`); // Debug log
+
+      if (type === 'expense') {
+        console.log(`Text: Assigning to expense columns: name=${name} to index 1, CAD=${amount} to index 2, USD=$${amount} to index 3`);
+        rowData[1] = name || rowData[1] || 'Unknown'; // Column B (Expense name)
+        rowData[2] = currency === 'CAD' ? amount : (rowData[2] || ''); // Column C (CAD expense)
+        rowData[3] = currency === 'USD' ? `$${amount}` : (rowData[3] || ''); // Column D (USD expense)
+        // Preserve earnings and PayPal columns
+        rowData[4] = rowData[4] || ''; // Column E (Earnings name)
+        rowData[5] = rowData[5] || ''; // Column F (CAD earning)
+        rowData[6] = rowData[6] || ''; // Column G (USD earning)
+        rowData[8] = rowData[8] || ''; // Column I (USD PayPal fee)
+        rowData[9] = rowData[9] || ''; // Column J (CAD PayPal fee)
+        // Ensure image links are preserved/updated
+        rowData[10] = rowData[10] || ''; // Column K (Expense Google Drive Link)
+        rowData[11] = rowData[11] || ''; // Column L (Earnings Google Drive Link)
+      } else if (type === 'earning') {
+        console.log(`Text: Assigning to earning columns: name=${name} to index 4, CAD=${amount} to index 5, USD=$${amount} to index 6`);
+        rowData[4] = name || rowData[4] || 'Unknown'; // Column E (Earnings name)
+        rowData[5] = currency === 'CAD' ? amount : (rowData[5] || ''); // Column F (CAD earning)
+        rowData[6] = currency === 'USD' ? `$${amount}` : (rowData[6] || ''); // Column G (USD earning)
+        // Preserve expense and PayPal columns
+        rowData[1] = rowData[1] || ''; // Column B (Expense name)
+        rowData[2] = rowData[2] || ''; // Column C (CAD expense)
+        rowData[3] = rowData[3] || ''; // Column D (USD expense)
+        rowData[8] = rowData[8] || ''; // Column I (USD PayPal fee)
+        rowData[9] = rowData[9] || ''; // Column J (CAD PayPal fee)
+        // Ensure image links are preserved/updated
+        rowData[10] = rowData[10] || ''; // Column K (Expense Google Drive Link)
+        rowData[11] = rowData[11] || ''; // Column L (Earnings Google Drive Link)
+      } else if (type === 'paypal_fee') {
+        console.log(`Text: Assigning to PayPal fee columns: USD=$${amount} to index 8, CAD=${amount} to index 9`);
+        rowData[8] = currency === 'USD' ? `$${amount}` : (rowData[8] || ''); // Column I (USD PayPal fee)
+        rowData[9] = currency === 'CAD' ? amount : (rowData[9] || ''); // Column J (CAD PayPal fee)
+        // Preserve expense and earnings columns
+        rowData[1] = rowData[1] || ''; // Column B (Expense name)
+        rowData[2] = rowData[2] || ''; // Column C (CAD expense)
+        rowData[3] = rowData[3] || ''; // Column D (USD expense)
+        rowData[4] = rowData[4] || ''; // Column E (Earnings name)
+        rowData[5] = rowData[5] || ''; // Column F (CAD earning)
+        rowData[6] = rowData[6] || ''; // Column G (USD earning)
+        // Ensure image links are preserved/updated
+        rowData[10] = rowData[10] || ''; // Column K (Expense Google Drive Link)
+        rowData[11] = rowData[11] || ''; // Column L (Earnings Google Drive Link)
+      }
+
+      console.log(`Text: Final rowData before insert: ${JSON.stringify(rowData)}`); // Debug final state
+
+      try {
+        if (insertIndex > 0) {
+          console.log(`Text: Updating row ${insertIndex + 1} with data=${JSON.stringify(rowData)}`);
+          await updateRow(tabName, insertIndex, rowData);
+        } else {
+          console.log(`Text: Inserting new row at ${targetInsertIndex !== null ? targetInsertIndex + 1 : 'bottom'} with data=${JSON.stringify(rowData)}`);
+          await insertRow(tabName, rowData, targetInsertIndex);
+        }
+        bot.sendMessage(chatId, `SUCCESS Added ${type} for ${name || 'Unknown'} on ${formattedDate}`);
+      } catch (err) {
+        console.error(`Text: Error adding entry: ${err.message}`);
+        bot.sendMessage(chatId, `ERROR Failed to add entry: ${err.message}`);
+      }
+      return;
    }
    if (msg.photo) {
      const fileId = msg.photo[msg.photo.length - 1].file_id;
+     const caption = msg.caption?.toLowerCase() || ''; // Get the caption if it exists
+     console.log(`Image: Detected caption: "${caption}"`);
+
      let fileUrl;
      try {
        fileUrl = await bot.getFileLink(fileId);
@@ -489,182 +756,58 @@ require('dotenv').config();
        return bot.sendMessage(chatId, `ERROR Failed to extract image: ${err.message}`);
      }
 
-     console.log(`Image: ${fileId}: Parsed data: ${JSON.stringify(parsed)}`);
-     const { amount, currency, name, date } = parsed;
+     console.log(`Image: ${fileId}: Parsed data from image: ${JSON.stringify(parsed)}`);
 
-     // Normalize date using GPT-4o
-     const datePrompt = `
-       You are a strict date parser. Analyze the input date string and return a JSON object with the day and month in the format:
-       {
-         "day": number,
-         "month": "full month name in English"
-       }
-       - "day" MUST be a number (1-31), not a string.
-       - "month" MUST be a full English month name (e.g., "January", "February").
-       - Ignore any year provided.
-       - Handle formats like "Feb 28, 2025", "28 Feb", "28, Feb", "28/02/2025", "28 February", "28-Feb-2025".
-       - For "day Month" (e.g., "28 Feb"), treat first part as day, second as month.
-       - For "Month day" (e.g., "Feb 28"), treat first part as month, second as day.
-       - If ambiguous or invalid, return { "day": null, "month": null }.
-       - Return ONLY the JSON object as plain text, no markdown or code fences.
-       Examples:
-       Input: "Feb 28, 2025" -> {"day":28,"month":"February"}
-       Input: "28 Feb" -> {"day":28,"month":"February"}
-       Input: "28, Feb" -> {"day":28,"month":"February"}
-       Input: "28/02/2025" -> {"day":28,"month":"February"}
-       Input: "28 February" -> {"day":28,"month":"February"}
-       Input: "28" -> {"day":null,"month":null}
-       Input: "${date}"
-     `;
+     // Determine 'type' from caption first
+     let transactionTypeFromCaption = null;
+     if (caption.includes('expense')) {
+       transactionTypeFromCaption = 'expense';
+     } else if (caption.includes('earning')) {
+       transactionTypeFromCaption = 'earning';
+     } else if (caption.includes('paypal fee') || caption.includes('paypal_fee')) {
+       transactionTypeFromCaption = 'paypal_fee';
+     }
 
-     let normalizedDate;
+     // Use type from caption if available, otherwise from parsed image data
+     let transactionType = transactionTypeFromCaption || parsed.type;
+
+     // If no specific type is found in caption AND it's not a PayPal fee from image parsing, ask for clarification
+     if (!transactionTypeFromCaption && parsed.type !== 'paypal_fee') {
+         // Create temp file now, to store for later processing
+         const tempPath = path.join(TMP_DIR, `${uuidv4()}.jpg`);
+         await fsPromises.writeFile(tempPath, Buffer.from(response.data));
+
+         pendingImageTransactions[chatId] = {
+             fileId: fileId,
+             parsed: parsed,
+             tempPath: tempPath,
+             responseData: response.data // Store original response data to avoid re-download
+         };
+         return bot.sendMessage(chatId, `Please specify if this is an 'expense' or an 'earning' for the image you sent. You can reply with "expense" or "earning" in the caption.`);
+     }
+
+     // If we reach here, either the type was in the caption or AI identified it as paypal_fee.
+     // Proceed with processing the transaction.
+     const tempPath = path.join(TMP_DIR, `${uuidv4()}.jpg`); // Still need a temp path for initial processing
+     await fsPromises.writeFile(tempPath, Buffer.from(response.data)); // Save temp file now
+
      try {
-       const dateResult = await openai.chat.completions.create({
-         model: 'gpt-4o',
-         messages: [{ role: 'user', content: datePrompt }],
-         max_tokens: 50,
-         temperature: 0
-       });
-       const rawResponse = dateResult.choices[0].message.content.trim();
-       console.log(`Image: ${fileId}: GPT-4o response: ${rawResponse}`);
-       normalizedDate = JSON.parse(rawResponse);
-       console.log(`Image: ${fileId}: Normalized date: ${JSON.stringify(normalizedDate)}`);
+         await processImageTransaction(
+             chatId,
+             fileId,
+             parsed,
+             transactionType,
+             tempPath,
+             response.data
+         );
      } catch (err) {
-       console.error(`Image: ${fileId}: Failed to normalize date "${date}":`, err.message);
-       // Fallback: manual parsing
-       const parts = date.trim().split(/[,\s]+/).filter(part => part);
-       if (parts.length >= 2) {
-         let dayStr, monthStr;
-         if (/^[0-9]+$/.test(parts[0])) {
-           // "28 Feb" -> day first
-           dayStr = parts[0].replace(/[^0-9]/g, '');
-           monthStr = parts[1].replace(/[^a-zA-Z]/g, '');
-         } else {
-           // "Feb 28" -> month first
-           monthStr = parts[0].replace(/[^a-zA-Z]/g, '');
-           dayStr = parts[1].replace(/[^0-9]/g, '');
-         }
-         const monthFull = {
-           jan: 'January', feb: 'February', mar: 'March', apr: 'April',
-           may: 'May', jun: 'June', jul: 'July', aug: 'August',
-           sep: 'September', oct: 'October', nov: 'November', dec: 'December'
-         }[monthStr.toLowerCase()] || monthStr;
-         const dayNum = parseInt(dayStr);
-         if (dayNum >= 1 && dayNum <= 31 && Object.keys(monthMap).includes(capitalize(monthFull))) {
-           normalizedDate = { day: dayNum, month: monthFull };
-           console.log(`Image: ${fileId}: Fallback date: ${JSON.stringify(normalizedDate)}`);
-         }
-       }
-       if (!normalizedDate) {
-         console.error(`Image: ${fileId}: Fallback failed for date "${date}"`);
-         return bot.sendMessage(chatId, `ERROR Failed to parse date: "${date}"`);
-       }
-     }
-
-     if (
-       !normalizedDate.day ||
-       !normalizedDate.month ||
-       typeof normalizedDate.day !== 'number' ||
-       normalizedDate.day < 1 ||
-       normalizedDate.day > 31 ||
-       typeof normalizedDate.month !== 'string'
-     ) {
-       console.error(`Image: ${fileId}: Invalid date: ${JSON.stringify(normalizedDate)}`);
-       return bot.sendMessage(chatId, `WARNING Invalid date: "${date}"`);
-     }
-
-     const validMonths = Object.keys(monthMap).map(m => m.toLowerCase());
-     const capitalMonth = capitalize(normalizedDate.month);
-     if (!validMonths.includes(capitalMonth.toLowerCase())) {
-       console.error(`Image: ${fileId}: Invalid month: "${normalizedDate.month}" -> "${capitalMonth}"`);
-       return bot.sendMessage(chatId, `WARNING Invalid month: "${normalizedDate.month}"`);
-     }
-
-     const day = normalizedDate.day.toString();
-     const tabName = monthMap[capitalMonth] || capitalMonth;
-
-     // Numeric month for Date constructor
-     const monthIndex = Object.keys(monthMap).indexOf(capitalMonth) + 1; // February = 2
-     const dateString = `${monthIndex}/${day}/${new Date().getFullYear()}`;
-     console.log(`Image: ${fileId}: Date: ${dateString}`);
-     const formattedDate = new Date(dateString).toLocaleDateString('en-US', { month: 'numeric', day: 'numeric', year: 'numeric' });
-     if (isNaN(new Date(formattedDate))) {
-       console.error(`Image: ${fileId}: Invalid date: ${dateString}`);
-       return bot.sendMessage(chatId, `WARNING Invalid date: ${day} ${capitalMonth}`);
-     }
-
-     const tempPath = path.join(TMP_DIR, `${uuidv4()}.jpg`);
-     try {
-       await fsPromises.writeFile(tempPath, Buffer.from(response.data));
-       console.log(`Image: ${fileId}: Saved temp file: ${tempPath}`);
-       const folderId = /earning|revenue|invoice|payment received/i.test(name) ? EARNINGS_FOLDER : EXPENSES_FOLDER;
-       const link = await uploadToDrive(tempPath, `${name}_${formattedDate}.jpg`, folderId);
-       console.log(`Image: ${fileId}: Drive link: ${link}`);
-
-       const rowData = new Array(12).fill('');
-       rowData[0] = formattedDate;
-       rowData[1] = name || 'Unknown';
-       rowData[2] = currency === 'CAD' ? amount : '';
-       rowData[3] = currency === 'USD' ? `$${amount}` : '';
-       rowData[10] = folderId === EXPENSES_FOLDER ? link : '';
-       rowData[11] = folderId === EARNINGS_FOLDER ? link : '';
-
-       let sheet;
-       try {
-         sheet = await getSheet(tabName);
-       } catch (err) {
-         console.error(`Image: ${fileId}: Failed to get sheet ${tabName}:`, err.message);
-         return bot.sendMessage(chatId, `WARNING ${err.message}`);
-       }
-
-       let insertIndex = sheet.findIndex((row, i) => {
-         if (i === 0) return false;
-         const rowDate = new Date(row[0]);
-         const targetDate = new Date(`${monthIndex}/${day}/${new Date().getFullYear()}`);
-         return rowDate.getDate() === targetDate.getDate() &&
-                rowDate.getMonth() === targetDate.getMonth() &&
-                rowDate.getFullYear() === targetDate.getFullYear() &&
-                row.slice(1, 12).every(cell => !cell?.trim());
-       });
-
-       let targetInsertIndex = null;
-       if (insertIndex === -1) {
-         let lastIndex = -1;
-         for (let i = 1; i < sheet.length; i++) {
-           const rowDate = new Date(sheet[i][0]);
-           const targetDate = new Date(`${monthIndex}/${day}/${new Date().getFullYear()}`);
-           if (rowDate.getDate() === targetDate.getDate() &&
-               rowDate.getMonth() === targetDate.getMonth() &&
-               rowDate.getFullYear() === targetDate.getFullYear()) {
-             lastIndex = i;
-           }
-         }
-         if (lastIndex !== -1) {
-           targetInsertIndex = lastIndex + 1;
-         }
-       }
-
-       // Simplified log to avoid syntax issues
-       const filteredRows = sheet.filter(row => new Date(row[0]).toLocaleDateString('en-US', { month: 'numeric', day: 'numeric', year: 'numeric' }) === formattedDate);
-       console.log(`Image: ${fileId}: Insert info: index=${insertIndex}, date=${formattedDate}, targetIndex=${targetInsertIndex}, rows=${JSON.stringify(filteredRows)}`);
-
-       try {
-         if (insertIndex > 0) {
-           console.log(`Image: ${fileId}: Updating row ${insertIndex + 1} with data=${JSON.stringify(rowData)}`);
-           await updateRow(tabName, insertIndex, rowData);
-         } else {
-           console.log(`Image: ${fileId}: Inserting row at ${targetInsertIndex !== null ? targetInsertIndex + 1 : 'bottom'} with data=${JSON.stringify(rowData)}`);
-           await insertRow(tabName, rowData, targetInsertIndex);
-         }
-         bot.sendMessage(chatId, `IMAGE Added receipt for ${name || 'Unknown'} on ${formattedDate}`);
-       } catch (err) {
-         console.error(`Image: ${fileId}: Error adding entry:`, err.message);
+         console.error(`Image: Error processing receipt:`, err.message);
          bot.sendMessage(chatId, `ERROR Failed to process receipt: ${err.message}`);
-       }
-     } catch (err) {
-       console.error(`Image: ${fileId}: Error processing receipt:`, err.message);
-       bot.sendMessage(chatId, `ERROR Failed to process receipt: ${err.message}`);
      } finally {
-       await fsPromises.unlink(tempPath);
+         // This finally block handles the tempPath cleanup for initial processing
+         if (fs.existsSync(tempPath)) {
+             await fsPromises.unlink(tempPath).catch(err => console.error(`Failed to delete temp file ${tempPath}:`, err.message));
+         }
      }
-   } // Closing brace for bot.on('message', ...) - Line 669
+   }
+ });
