@@ -130,4 +130,4 @@ dist
 .pnp.*
 
 # Replit debugger
-.breakpoints
+.breakpointsservice-account-key.json
