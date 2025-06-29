@@ -550,6 +550,81 @@ async function processImageTransaction(chatId, fileId, parsed, transactionType, 
        return;
      }
    }
+if (text && /update .* amount/i.test(text)) {
+  const updatePrompt = `
+    You are a smart finance assistant. A user will ask you to update an amount in their transaction sheet. Extract these details in JSON with no markdown or code fences:
+    {
+      "name": "expense or earning name",
+      "date": "day month" (e.g., "24 April"),
+      "amount": number,
+      "currency": "CAD|USD",
+      "valid": boolean
+    }
+    If you can't find all details, set "valid": false.
+    Example: "Update the amount for Amazon on April 24 to 7.77 CAD."
+    Expected JSON: {"name":"Amazon","date":"24 April","amount":7.77,"currency":"CAD","valid":true}
+    Input: "${text}"
+  `;
+
+  let parsed;
+  try {
+    const result = await openai.chat.completions.create({
+      model: 'gpt-4o',
+      messages: [{ role: 'user', content: updatePrompt }],
+    });
+    parsed = JSON.parse(result.choices[0].message.content.trim());
+    console.log("Update parsed response:", parsed);
+  } catch (err) {
+    console.error("Update parse error:", err.message);
+    return bot.sendMessage(chatId, `ERROR Failed to parse your update request.`);
+  }
+
+  if (!parsed || !parsed.valid) {
+    return bot.sendMessage(chatId, `⚠️ Sorry, I couldn’t understand your update request. Please include the date, name, and new amount.`);
+  }
+
+  const { name, date, amount, currency } = parsed;
+  const [day, monthStr] = date.split(" ");
+  const capitalMonth = capitalize(monthStr);
+  const tabName = monthMap[capitalMonth] || capitalMonth;
+  const baseDate = new Date(`${capitalMonth} ${day}, ${new Date().getFullYear()}`);
+  const formattedDate = baseDate.toLocaleDateString('en-US', { month: 'numeric', day: 'numeric', year: 'numeric' });
+
+  let sheet;
+  try {
+    sheet = await getSheet(tabName);
+  } catch (err) {
+    console.error(`Update: Failed to load sheet ${tabName}:`, err.message);
+    return bot.sendMessage(chatId, `⚠️ Couldn’t access the sheet for ${capitalMonth}.`);
+  }
+
+  let updated = false;
+  for (let i = 1; i < sheet.length; i++) {
+    const rowDate = new Date(sheet[i][0]);
+    if (rowDate.getTime() === baseDate.getTime()) {
+      const expenseName = sheet[i][1]?.toLowerCase() || "";
+      const earningName = sheet[i][4]?.toLowerCase() || "";
+      if (expenseName.includes(name.toLowerCase()) || earningName.includes(name.toLowerCase())) {
+        if (expenseName.includes(name.toLowerCase())) {
+          const colIndex = currency === 'CAD' ? 2 : 3;
+          sheet[i][colIndex] = currency === 'USD' ? `$${amount}` : amount;
+        } else {
+          const colIndex = currency === 'CAD' ? 5 : 6;
+          sheet[i][colIndex] = currency === 'USD' ? `$${amount}` : amount;
+        }
+        await updateRow(tabName, i, sheet[i]);
+        updated = true;
+        bot.sendMessage(chatId, `✅ Updated ${currency} amount for ${name} on ${formattedDate}: ${amount}.`);
+        break;
+      }
+    }
+  }
+
+  if (!updated) {
+    bot.sendMessage(chatId, `⚠️ Couldn’t find an entry for "${name}" on ${formattedDate}. Please check the date or name.`);
+  }
+  return; // stop further processing of this message
+}
 
    // Original text message processing (if not a conversion request or photo)
    if (text && !msg.photo) {
