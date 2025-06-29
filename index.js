@@ -500,57 +500,7 @@ async function processImageTransaction(chatId, fileId, parsed, transactionType, 
            return;
        }
    }
-
-   // Handle conversion requests first (existing logic)
-   const monthKeywords = [...Object.keys(monthMap), ...Object.values(monthMap)].map(m => m.toLowerCase());
-   const monthMatch = monthKeywords.find(m => text.includes(m));
-   const mentionedMonth = monthMatch
-     ? monthMap[capitalize(monthMatch)] || capitalize(monthMatch)
-     : (text.includes("all") ? "none" : null);
-
-   if (text && !msg.photo) { // This block handles regular text messages (not image captions)
-     const isConversionRequest = /convert.*usd|usd.*convert|update.*usd|missing.*usd|usd.*missing/i.test(text);
-     if (isConversionRequest && mentionedMonth && mentionedMonth !== 'none') {
-       console.log(`Conversion: Detected request for month ${mentionedMonth}`);
-       await handleUSDConversion(chatId, mentionedMonth);
-       return;
-     }
-
-     const conversionPrompt = `
-       Determine if the user's message is a request to convert USD to CAD for a specific month.
-       Return JSON (no markdown or code fences):
-       {
-         "isConversionRequest": boolean,
-         "month": "month name or null"
-       }
-       If no month is specified or "all" is mentioned, set month to null.
-       Example input: "convert USD in June"
-       Example output: {"isConversionRequest":true,"month":"June"}
-       Example input: "convert usd for june"
-       Example output: {"isConversionRequest":true,"month":null} // Modified example: "june" implies the month
-       Input: "${text}"
-     `;
-
-     let conversionParsed;
-     try {
-       const result = await openai.chat.completions.create({
-         model: 'gpt-4o',
-         messages: [{ role: 'user', content: conversionPrompt }],
-       });
-       conversionParsed = JSON.parse(result.choices[0].message.content.trim());
-       console.log(`Conversion: ChatGPT parsed: ${JSON.stringify(conversionParsed)}`);
-     } catch (err) {
-       console.error("ChatGPT conversion parse error:", err.message);
-       conversionParsed = { isConversionRequest: false, month: null };
-     }
-
-     if (conversionParsed.isConversionRequest && conversionParsed.month && conversionParsed.month !== 'none') {
-       console.log(`Conversion: ChatGPT detected request for month ${conversionParsed.month}`);
-       await handleUSDConversion(chatId, conversionParsed.month);
-       return;
-     }
-   }
-if (text && /update .* amount/i.test(text)) {
+  if (text && /update .* amount/i.test(text)) {
   const updatePrompt = `
     You are a smart finance assistant. A user will ask you to update an amount in their transaction sheet. Extract these details in JSON with no markdown or code fences:
     {
@@ -625,6 +575,57 @@ if (text && /update .* amount/i.test(text)) {
   }
   return; // stop further processing of this message
 }
+
+   // Handle conversion requests first (existing logic)
+   const monthKeywords = [...Object.keys(monthMap), ...Object.values(monthMap)].map(m => m.toLowerCase());
+   const monthMatch = monthKeywords.find(m => text.includes(m));
+   const mentionedMonth = monthMatch
+     ? monthMap[capitalize(monthMatch)] || capitalize(monthMatch)
+     : (text.includes("all") ? "none" : null);
+
+  
+   if (text && !msg.photo) { // This block handles regular text messages (not image captions)
+     const isConversionRequest = /convert.*usd|usd.*convert|update.*usd|missing.*usd|usd.*missing/i.test(text);
+     if (isConversionRequest && mentionedMonth && mentionedMonth !== 'none') {
+       console.log(`Conversion: Detected request for month ${mentionedMonth}`);
+       await handleUSDConversion(chatId, mentionedMonth);
+       return;
+     }
+
+     const conversionPrompt = `
+       Determine if the user's message is a request to convert USD to CAD for a specific month.
+       Return JSON (no markdown or code fences):
+       {
+         "isConversionRequest": boolean,
+         "month": "month name or null"
+       }
+       If no month is specified or "all" is mentioned, set month to null.
+       Example input: "convert USD in June"
+       Example output: {"isConversionRequest":true,"month":"June"}
+       Example input: "convert usd for june"
+       Example output: {"isConversionRequest":true,"month":null} // Modified example: "june" implies the month
+       Input: "${text}"
+     `;
+
+     let conversionParsed;
+     try {
+       const result = await openai.chat.completions.create({
+         model: 'gpt-4o',
+         messages: [{ role: 'user', content: conversionPrompt }],
+       });
+       conversionParsed = JSON.parse(result.choices[0].message.content.trim());
+       console.log(`Conversion: ChatGPT parsed: ${JSON.stringify(conversionParsed)}`);
+     } catch (err) {
+       console.error("ChatGPT conversion parse error:", err.message);
+       conversionParsed = { isConversionRequest: false, month: null };
+     }
+
+     if (conversionParsed.isConversionRequest && conversionParsed.month && conversionParsed.month !== 'none') {
+       console.log(`Conversion: ChatGPT detected request for month ${conversionParsed.month}`);
+       await handleUSDConversion(chatId, conversionParsed.month);
+       return;
+     }
+   }
 
    // Original text message processing (if not a conversion request or photo)
    if (text && !msg.photo) {
