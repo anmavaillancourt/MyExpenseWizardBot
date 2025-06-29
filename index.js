@@ -11,7 +11,7 @@ require('dotenv').config();
  // Environment variables
  const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
  const GOOGLE_SHEET_ID = process.env.GOOGLE_SHEET_ID;
- const SERVICE_ACCOUNT_JSON = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
+ const serviceAccount = JSON.parse(process.env.SERVICE_ACCOUNT_KEY_JSON);
  const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
  const EXPENSES_FOLDER = '1LXNlURWVeVW8WMlMjkbs88kpgAbR_oYA';
  const EARNINGS_FOLDER = '1zczS11J9iCgbpvdNdqsvSxr1BDnHghTs';
