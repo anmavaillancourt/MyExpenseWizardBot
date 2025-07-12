@@ -14,8 +14,8 @@ require('dotenv').config();
  const SERVICE_ACCOUNT_JSON = process.env.SERVICE_ACCOUNT_KEY_JSON;
  const serviceAccount = JSON.parse(SERVICE_ACCOUNT_JSON);
  const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
- const EXPENSES_FOLDER = '1LXNlURWVeVW8WMlMjkbs88kpgAbR_oYA';
- const EARNINGS_FOLDER = '1zczS11J9iCgbpvdNdqsvSxr1BDnHghTs';
+ const EXPENSES_FOLDER = '1HwZUEBGaS670shXjyvgUV85_vi8LQDgI';
+ const EARNINGS_FOLDER = '1sXHjmyrMvJOIcmGoQzoaT_brSE5gJVkI';
 
  // Ensure tmp directory exists
  const TMP_DIR = './tmp';
@@ -46,6 +46,53 @@ require('dotenv').config();
    return str.charAt(0).toUpperCase() + str.slice(1).toLowerCase();
  }
 
+async function findMatchingRowIndexOrAsk(sheetData, dateString, name, bot, chatId) {
+  const normalizedName = name.trim().toLowerCase();
+  const matches = [];
+
+  for (let i = 0; i < sheetData.length; i++) {
+    const row = sheetData[i];
+    const rowDate = (row[0] || '').toString().trim();
+    const columnsToCheck = [1, 4]; // Col B (Dépenses) and Col E (Gains)
+
+    if (rowDate === dateString) {
+      for (const col of columnsToCheck) {
+        const cell = (row[col] || '').toString().toLowerCase().trim();
+        if (cell.includes(normalizedName)) {
+          matches.push({ index: i, name: row[col], date: row[0] });
+        }
+      }
+    }
+  }
+
+  if (matches.length === 1) {
+    return matches[0].index;
+  }
+
+  if (matches.length > 1) {
+    const options = matches.map((match, idx) => `${idx + 1}: ${match.name} (${match.date})`).join('\n');
+    await bot.sendMessage(chatId, `🤔 I found multiple possible matches for "${name}" on ${dateString}:\n${options}\n\nReply with the number of the correct one.`);
+
+    return new Promise((resolve) => {
+      const listener = (responseMsg) => {
+        if (responseMsg.chat.id === chatId) {
+          const choice = parseInt(responseMsg.text.trim(), 10);
+          if (!isNaN(choice) && choice >= 1 && choice <= matches.length) {
+            bot.removeListener('message', listener);
+            resolve(matches[choice - 1].index);
+          } else {
+            bot.sendMessage(chatId, `❌ Invalid choice. Please reply with a number between 1 and ${matches.length}.`);
+          }
+        }
+      };
+      bot.on('message', listener);
+    });
+  }
+
+  await bot.sendMessage(chatId, `⚠️ No match found for "${name}" on ${dateString}.`);
+  return null;
+}
+
  async function getSheetId(tabName) {
    try {
      const spreadsheet = await sheets.spreadsheets.get({
@@ -62,6 +109,45 @@ require('dotenv').config();
      throw err;
    }
  }
+async function processTransactionData(chatId, transaction, sheet, rows, index, targetIndex = null) {
+  const sheetData = await sheet.getRows();
+  const dateFormatted = transaction.dateFormatted;
+  const newPaypalCAD = Number(transaction.amount).toFixed(2);
+
+  let finalRowIndex = targetIndex;
+
+  if (finalRowIndex === null) {
+    const finalRowIndex = await findMatchingRowIndexOrAsk(sheetData, dateFormatted, transaction.name, bot, chatId);
+
+    if (finalRowIndex === null) {
+      await bot.sendMessage(chatId, `⚠️ Unable to find a matching row for "${transaction.name}" on ${dateFormatted}.`);
+      return;
+    }
+
+    if (possibleMatches.length === 1) {
+      finalRowIndex = possibleMatches[0].index;
+    } else if (possibleMatches.length > 1) {
+      const message = `🤔 I found multiple rows for "${transaction.name}" on ${dateFormatted}. Which one should I update?\n\n` +
+        possibleMatches.map((m, idx) => `(${idx + 1}) ${m.name} on ${m.date}`).join('\n');
+      await bot.telegram.sendMessage(chatId, message);
+      return;
+    } else {
+      await bot.telegram.sendMessage(chatId, `⚠️ Could not find a row matching "${transaction.name}" on ${dateFormatted}.`);
+      return;
+    }
+  }
+
+  const targetRow = sheetData[finalRowIndex];
+  if (!targetRow) {
+    await bot.telegram.sendMessage(chatId, `⚠️ Could not find the correct row to update.`);
+    return;
+  }
+
+  targetRow['PayPal CAD'] = newPaypalCAD;
+  await targetRow.save();
+  await bot.telegram.sendMessage(chatId, `✅ PayPal fee of ${transaction.amount} ${transaction.currency} added to "${targetRow['Dépenses']}" on ${dateFormatted}.`);
+}
+
 
  async function getSheet(tabName) {
    try {
@@ -130,13 +216,18 @@ require('dotenv').config();
      console.log(`Drive: Accessing file at ${filePath} for upload`);
 
      const res = await drive.files.create({
-       requestBody: { name: fileName, parents: [folderId] },
-       media: { mimeType: 'image/jpeg', body: fs.createReadStream(filePath) },
+       requestBody: {
+         name: fileName,
+         parents: [folderId],
+       },
+       media: {
+         mimeType: 'image/jpeg',
+         body: fs.createReadStream(filePath),
+       },
+       supportsAllDrives: true, // 👈 This is the key for Shared Drives
+       fields: 'id',
      });
-     await drive.permissions.create({
-       fileId: res.data.id,
-       requestBody: { role: 'reader', type: 'anyone' },
-     });
+
      const link = `https://drive.google.com/file/d/${res.data.id}/view`;
      console.log(`Drive: Uploaded file ${fileName} to folder ${folderId}, link: ${link}`);
      return link;
@@ -145,6 +236,7 @@ require('dotenv').config();
      throw err;
    }
  }
+
 
  async function extractFromImage(base64Image) {
    const prompt = `
@@ -548,27 +640,82 @@ async function processImageTransaction(chatId, fileId, parsed, transactionType, 
     return bot.sendMessage(chatId, `⚠️ Couldn’t access the sheet for ${capitalMonth}.`);
   }
 
-  let updated = false;
-  for (let i = 1; i < sheet.length; i++) {
-    const rowDate = new Date(sheet[i][0]);
-    if (rowDate.getTime() === baseDate.getTime()) {
-      const expenseName = sheet[i][1]?.toLowerCase() || "";
-      const earningName = sheet[i][4]?.toLowerCase() || "";
+    let updated = false;
+
+    // 1) First, find candidate rows on the right date
+    const candidateRows = [];
+    for (let i = 1; i < sheet.length; i++) {
+      const rowDate = new Date(sheet[i][0]);
+      if (rowDate.getTime() === baseDate.getTime()) {
+        candidateRows.push({ index: i, row: sheet[i] });
+      }
+    }
+
+    if (candidateRows.length === 0) {
+      bot.sendMessage(chatId, `⚠️ Couldn't find any entries on ${formattedDate} in ${tabName}.`);
+      return;
+    }
+
+    // 2) Quick .includes() pass
+    let bestIndex = -1;
+    for (const { index, row } of candidateRows) {
+      const expenseName = row[1]?.toLowerCase() || "";
+      const earningName = row[4]?.toLowerCase() || "";
       if (expenseName.includes(name.toLowerCase()) || earningName.includes(name.toLowerCase())) {
-        if (expenseName.includes(name.toLowerCase())) {
-          const colIndex = currency === 'CAD' ? 2 : 3;
-          sheet[i][colIndex] = currency === 'USD' ? `$${amount}` : amount;
-        } else {
-          const colIndex = currency === 'CAD' ? 5 : 6;
-          sheet[i][colIndex] = currency === 'USD' ? `$${amount}` : amount;
-        }
-        await updateRow(tabName, i, sheet[i]);
-        updated = true;
-        bot.sendMessage(chatId, `✅ Updated ${currency} amount for ${name} on ${formattedDate}: ${amount}.`);
+        bestIndex = index;
+        console.log(`Hybrid match: Quick .includes() found match in row ${index + 1}`);
         break;
       }
     }
-  }
+
+    // 3) Fallback to OpenAI fuzzy matching if no quick match
+    if (bestIndex === -1) {
+      const candidateNames = candidateRows.map(({ row }) => {
+        return row[1] || row[4]; // expense or earning name
+      }).filter(Boolean);
+
+      const fuzzyPrompt = `
+    You are a smart assistant helping update a spreadsheet. The user typed: "${name}". Given candidate names: ${JSON.stringify(candidateNames)}, return JSON like {"bestMatch": "name"} or {"bestMatch": null} if no match.
+      `;
+
+      try {
+        const result = await openai.chat.completions.create({
+          model: 'gpt-4o',
+          messages: [{ role: 'user', content: fuzzyPrompt }],
+        });
+        const parsed = JSON.parse(result.choices[0].message.content.trim());
+        console.log(`Hybrid match: OpenAI responded with: ${JSON.stringify(parsed)}`);
+        const bestMatch = parsed.bestMatch;
+
+        if (bestMatch) {
+          const match = candidateRows.find(({ row }) => (row[1] || row[4]) === bestMatch);
+          if (match) {
+            bestIndex = match.index;
+            console.log(`Hybrid match: OpenAI matched "${bestMatch}" at row ${bestIndex + 1}`);
+          }
+        }
+      } catch (err) {
+        console.error(`Hybrid match: OpenAI error:`, err.message);
+      }
+    }
+
+    // 4) Perform update or notify user
+    if (bestIndex !== -1) {
+      const row = sheet[bestIndex];
+      if (row[1]?.toLowerCase().includes(name.toLowerCase())) {
+        const colIndex = currency === 'CAD' ? 2 : 3;
+        row[colIndex] = currency === 'USD' ? `$${amount}` : amount;
+      } else {
+        const colIndex = currency === 'CAD' ? 5 : 6;
+        row[colIndex] = currency === 'USD' ? `$${amount}` : amount;
+      }
+      await updateRow(tabName, bestIndex, row);
+      updated = true;
+      bot.sendMessage(chatId, `✅ Updated ${currency} amount for ${name} on ${formattedDate}: ${amount}.`);
+    } else {
+      bot.sendMessage(chatId, `⚠️ Couldn't find an entry matching "${name}" on ${formattedDate}. Please check your spelling or date.`);
+    }
+
 
   if (!updated) {
     bot.sendMessage(chatId, `⚠️ Couldn’t find an entry for "${name}" on ${formattedDate}. Please check the date or name.`);
@@ -583,7 +730,7 @@ async function processImageTransaction(chatId, fileId, parsed, transactionType, 
      ? monthMap[capitalize(monthMatch)] || capitalize(monthMatch)
      : (text.includes("all") ? "none" : null);
 
-  
+
    if (text && !msg.photo) { // This block handles regular text messages (not image captions)
      const isConversionRequest = /convert.*usd|usd.*convert|update.*usd|missing.*usd|usd.*missing/i.test(text);
      if (isConversionRequest && mentionedMonth && mentionedMonth !== 'none') {
@@ -663,31 +810,118 @@ async function processImageTransaction(chatId, fileId, parsed, transactionType, 
      }
 
      if (!parsed || !parsed.valid) {
-       return bot.sendMessage(chatId, `WARNING Sorry, I couldn't understand the transaction. Please clarify (e.g., "spent 10 CAD for coffee on 5 June").`);
-     }
+        // This line remains the same
+        return bot.sendMessage(chatId, `WARNING Sorry, I couldn't understand the transaction. Please clarify (e.g., "spent 10 CAD for coffee on 5 June").`);
+      }
 
-     const { type, amount, currency, name, date } = parsed;
-     const [day, monthStr] = date.split(" ");
-     const capitalMonth = capitalize(monthStr);
-     const tabName = monthMap[capitalMonth] || capitalMonth;
+      const { type, amount, currency, name, date } = parsed;
+      const [day, monthStr] = date.split(" ");
+      const capitalMonth = capitalize(monthStr);
+      const tabName = monthMap[capitalMonth] || capitalMonth;
 
-     const knownMonthNames = [...Object.keys(monthMap), ...Object.values(monthMap)].map(m => m.toLowerCase());
-     if (!knownMonthNames.includes(capitalMonth.toLowerCase())) {
-       return bot.sendMessage(chatId, `WARNING Invalid month: "${monthStr || 'none'}". Please use a valid month.`);
-     }
+      const knownMonthNames = [...Object.keys(monthMap), ...Object.values(monthMap)].map(m => m.toLowerCase());
+      if (!knownMonthNames.includes(capitalMonth.toLowerCase())) {
+        return bot.sendMessage(chatId, `WARNING Invalid month: "${monthStr || 'none'}". Please use a valid month.`);
+      }
 
-     const baseDate = new Date(`${capitalMonth} ${day}, ${new Date().getFullYear()}`);
-     if (isNaN(baseDate)) {
-       return bot.sendMessage(chatId, `WARNING Invalid date: ${capitalMonth} ${day}`);
-     }
-     const formattedDate = baseDate.toLocaleDateString('en-US', { month: 'numeric', day: 'numeric', year: 'numeric' });
+      const baseDate = new Date(`${capitalMonth} ${day}, ${new Date().getFullYear()}`);
+      if (isNaN(baseDate)) {
+        return bot.sendMessage(chatId, `WARNING Invalid date: ${capitalMonth} ${day}`);
+      }
+      const formattedDate = baseDate.toLocaleDateString('en-US', { month: 'numeric', day: 'numeric', year: 'numeric' });
 
-     let sheet;
-     try {
-       sheet = await getSheet(tabName);
-     } catch (err) {
-       return bot.sendMessage(chatId, `WARNING ${err.message}`);
-     }
+      let sheet;
+      try {
+        sheet = await getSheet(tabName);
+      } catch (err) {
+        return bot.sendMessage(chatId, `WARNING ${err.message}`);
+      }
+
+      if (type === 'paypal_fee') {
+         console.log(`Text: PayPal fee identified. Finding matching row for "${name}" on ${formattedDate}`);
+         const rowIndex = await findMatchingRowIndexOrAsk(sheet, formattedDate, name, bot, chatId);
+
+         if (rowIndex !== null) {
+           try {
+             let rowData = sheet[rowIndex].slice(); // Get the correct row's data
+             console.log(`Text: Found row ${rowIndex + 1}. Updating PayPal fee.`);
+
+             // Update PayPal fee columns (I for USD, J for CAD)
+             rowData[8] = currency === 'USD' ? `$${amount}` : (rowData[8] || '');
+             rowData[9] = currency === 'CAD' ? amount : (rowData[9] || '');
+
+             await updateRow(tabName, rowIndex, rowData);
+             bot.sendMessage(chatId, `✅ Added PayPal fee for **${name}** on ${formattedDate}.`);
+           } catch (err) {
+             console.error(`Text: Error updating PayPal fee:`, err.message);
+             bot.sendMessage(chatId, `ERROR Failed to update row for PayPal fee: ${err.message}`);
+           }
+         } else {
+             // The findMatchingRowIndexOrAsk function already sends the "No match found" message.
+             console.log(`Text: No matching row found for PayPal fee for "${name}" on ${formattedDate}.`);
+         }
+      } else {
+         // This is the original logic for adding a NEW expense or earning
+         console.log(`Text: Processing new ${type}. Looking for an available row on ${formattedDate}.`);
+         let insertIndex = -1;
+         for (let i = 1; i < sheet.length; i++) {
+           const rowDate = new Date(sheet[i][0]);
+           const expenseEmpty = [1, 2, 3].every(idx => !sheet[i][idx]?.trim());
+           const earningEmpty = [4, 5, 6].every(idx => !sheet[i][idx]?.trim());
+
+           if (rowDate.getTime() === baseDate.getTime()) {
+             if ((type === 'expense' && expenseEmpty) || (type === 'earning' && earningEmpty)) {
+               insertIndex = i;
+               break;
+             }
+           }
+         }
+
+         let targetInsertIndex = null;
+         if (insertIndex === -1) {
+           let lastIndex = -1;
+           for (let i = 1; i < sheet.length; i++) {
+             const rowDate = new Date(sheet[i][0]);
+             if (rowDate.getTime() === baseDate.getTime()) {
+               lastIndex = i;
+             }
+           }
+           if (lastIndex !== -1) {
+             targetInsertIndex = lastIndex + 1;
+           }
+         }
+
+         let rowData = new Array(12).fill('');
+         rowData[0] = formattedDate;
+
+         if (insertIndex > 0) {
+           rowData = sheet[insertIndex].slice();
+         }
+
+         if (type === 'expense') {
+           rowData[1] = name || rowData[1] || 'Unknown';
+           rowData[2] = currency === 'CAD' ? amount : (rowData[2] || '');
+           rowData[3] = currency === 'USD' ? `$${amount}` : (rowData[3] || '');
+         } else if (type === 'earning') {
+           rowData[4] = name || rowData[4] || 'Unknown';
+           rowData[5] = currency === 'CAD' ? amount : (rowData[5] || '');
+           rowData[6] = currency === 'USD' ? `$${amount}` : (rowData[6] || '');
+         }
+
+         try {
+           if (insertIndex > 0) {
+             await updateRow(tabName, insertIndex, rowData);
+           } else {
+             await insertRow(tabName, rowData, targetInsertIndex);
+           }
+           bot.sendMessage(chatId, `SUCCESS Added ${type} for **${name || 'Unknown'}** on ${formattedDate}`);
+         } catch (err) {
+           console.error(`Text: Error adding entry: ${err.message}`);
+           bot.sendMessage(chatId, `ERROR Failed to add entry: ${err.message}`);
+         }
+      }
+
+      return;
 
       let insertIndex = -1;
       for (let i = 1; i < sheet.length; i++) {
@@ -862,6 +1096,7 @@ async function processImageTransaction(chatId, fileId, parsed, transactionType, 
          };
          return bot.sendMessage(chatId, `Please specify if this is an 'expense' or an 'earning' for the image you sent. You can reply with "expense" or "earning" in the caption.`);
      }
+     
 
      // If we reach here, either the type was in the caption or AI identified it as paypal_fee.
      // Proceed with processing the transaction.
